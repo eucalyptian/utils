@@ -125,7 +125,3 @@ def engine_generator(
     )
     db_url = f"mssql+pyodbc:///?odbc_connect={db_odbc}"
     return create_engine(db_url)
-
-if __name__ == "__main__":
-    main()
-
