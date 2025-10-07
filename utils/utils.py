@@ -125,3 +125,15 @@ def engine_generator(
     )
     db_url = f"mssql+pyodbc:///?odbc_connect={db_odbc}"
     return create_engine(db_url)
+
+
+def get_dtype_mapping(df, max_length: Literal[255, 'max']):
+    if max_length == 'max':
+        length = None
+    else:
+        length = 255
+    dtype_mapping = {}
+    for col, dtype in df.dtypes.items():
+        if dtype in ['object', 'string']:  # Object types are often text columns
+            dtype_mapping[col] = NVARCHAR(length)  # Adjust NVARCHAR size as needed
+    return dtype_mapping
