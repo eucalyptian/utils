@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Literal
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine, text
 
