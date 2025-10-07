@@ -1,6 +1,6 @@
 from typing import Optional, Literal
 from urllib.parse import quote_plus
-from sqlalchemy import create_engine, text
+from sqlalchemy import NVARCHAR, create_engine, text
 
 
 def _build_odbc_connect(
