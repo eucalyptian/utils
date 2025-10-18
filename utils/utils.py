@@ -2,6 +2,12 @@ from typing import Optional, Literal
 from urllib.parse import quote_plus
 from sqlalchemy import NVARCHAR, create_engine, text
 
+proxies = {
+    'http': None,
+    'https': None,
+    'socks': None,
+    'ftp': None,
+}
 
 def _build_odbc_connect(
     server_str: str,
