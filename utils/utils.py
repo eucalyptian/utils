@@ -2,6 +2,20 @@ from typing import Optional, Literal
 from urllib.parse import quote_plus
 from sqlalchemy import NVARCHAR, create_engine, text
 
+
+# setup logger to be created based on module name and reset every 24 hours at midnight. only keeps yesterday log as a separate date-named file.
+def setup_logger():
+  module_name = os.path.splitext(os.path.basename(__file__))[0]
+  log_file = f"{module_name}.log"
+  # Set up rotating log handler
+  log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+  log_handler = TimedRotatingFileHandler(log_file, when='midnight', interval=1, backupCount=1, encoding='utf-8')
+  log_handler.setFormatter(log_formatter)
+  logger = logging.getLogger(module_name)
+  logger.setLevel(logging.INFO)
+  logger.addHandler(log_handler)
+  return logger
+
 proxies = {
     'http': None,
     'https': None,
