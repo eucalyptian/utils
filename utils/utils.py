@@ -1,7 +1,8 @@
+from sqlalchemy import NVARCHAR, create_engine, text, inspect
+from pandas.io.sql import get_schema
 from typing import Optional, Literal
 from urllib.parse import quote_plus
-from sqlalchemy import NVARCHAR, create_engine, text
-
+import re
 
 # setup logger to be created based on module name and reset every 24 hours at midnight. only keeps yesterday log as a separate date-named file.
 def setup_logger():
@@ -157,3 +158,60 @@ def get_dtype_mapping(df, max_length: Literal[255, 'max']):
         if dtype in ['object', 'string']:  # Object types are often text columns
             dtype_mapping[col] = NVARCHAR(length)  # Adjust NVARCHAR size as needed
     return dtype_mapping
+
+
+
+
+def parse_create_table(ddl: str) -> dict:
+    # Extract the part inside parentheses
+    match = re.search(r'\((.*)\)', ddl, re.DOTALL)
+    if not match:
+        return {}
+
+    columns_block = match.group(1)
+
+    # Split lines and strip
+    lines = [line.strip().rstrip(',') for line in columns_block.splitlines() if line.strip()]
+
+    col_types = {}
+    for line in lines:
+        # Match bracketed or non-bracketed column names
+        match = re.match(r'(\[.*?\]|\w+)\s+(.+)', line)
+        if match:
+            raw_name, raw_type = match.groups()
+            col_name = raw_name.strip('[]')  # Remove brackets
+            col_type = raw_type.strip()
+            col_types[col_name] = col_type
+
+    return col_types
+
+def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_value, allow_column_mismatch, max_length=255):
+    inspector = inspect(engine_name)
+    table_exists = table_name in inspector.get_table_names()
+    dtype = get_dtype_mapping(df, max_length=max_length)
+    auto_dtypes = parse_create_table(get_schema(df, name='my_table', con=engine_name))
+    with engine_name.begin() as conn:
+        if not table_exists:
+            df.to_sql(table_name, con=conn, if_exists='fail', index=False, dtype=dtype)
+        else:
+            if allow_column_mismatch:
+                # Add new columns if needed
+                # Get current columns from SQL
+                inspector = inspect(conn)
+                columns_in_table = [col['name'] for col in inspector.get_columns(table_name)]
+
+                # Find new columns
+                new_columns = [col for col in df.columns if col not in columns_in_table]
+
+                # Alter table to add new columns
+                for col in new_columns:
+                    if col in dtype.keys():
+                        new_dtype = dtype[col]  # or infer based on df[col].dtype
+                    else:
+                        new_dtype = auto_dtypes[col]
+                    
+                    conn.execute(text(f'ALTER TABLE {table_name} ADD [{col}] {new_dtype}'))
+            # Delete old data for this site
+            delete_query = text(f"DELETE FROM {table_name} WHERE {identifier_column} = :identifier_value")
+            conn.execute(delete_query, {f"identifier_value": identifier_value})
+            df.to_sql(table_name, con=conn, if_exists='append', index=False, dtype=dtype)
