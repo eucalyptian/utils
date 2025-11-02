@@ -1,4 +1,4 @@
-from sqlalchemy import NVARCHAR, create_engine, text, inspect
+from sqlalchemy import NVARCHAR, create_engine, text, inspect, MetaData, Table
 from pandas.io.sql import get_schema
 from typing import Optional, Literal
 from urllib.parse import quote_plus
@@ -185,10 +185,11 @@ def parse_create_table(ddl: str) -> dict:
 
     return col_types
 
-def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_value, allow_column_mismatch, max_length=255):
+def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_value, allow_column_mismatch, max_length=255, dtype=None):
     inspector = inspect(engine_name)
     table_exists = table_name in inspector.get_table_names()
-    dtype = get_dtype_mapping(df, max_length=max_length)
+    if not dtype:
+      dtype = get_dtype_mapping(df, max_length=max_length)
     auto_dtypes = parse_create_table(get_schema(df, name='my_table', con=engine_name))
     with engine_name.begin() as conn:
         if not table_exists:
@@ -215,3 +216,43 @@ def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_
             delete_query = text(f"DELETE FROM {table_name} WHERE {identifier_column} = :identifier_value")
             conn.execute(delete_query, {f"identifier_value": identifier_value})
             df.to_sql(table_name, con=conn, if_exists='append', index=False, dtype=dtype)
+
+
+def get_dtype_mapping_from_table(df: pd.DataFrame, engine, table_name: str, schema: str = "dbo", include_only_df_cols: bool = True):
+    """
+    Reads the SQL Server table schema and returns a dtype mapping dictionary
+    for use in pandas.to_sql().
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The dataframe whose columns you want to map.
+    engine : sqlalchemy.Engine
+        SQLAlchemy engine connected to the SQL Server database.
+    table_name : str
+        The name of the SQL table to inspect.
+    schema : str, default 'dbo'
+        Schema name where the table resides.
+    include_only_df_cols : bool, default True
+        If True, only return mappings for columns present in the dataframe.
+
+    Returns
+    -------
+    dict
+        A dictionary suitable for the `dtype` argument in df.to_sql()
+        (e.g., {'fund': NVARCHAR(length=255), 'cost': FLOAT()}).
+    """
+
+    metadata = MetaData()
+    table = Table(table_name, metadata, autoload_with=engine, schema=schema)
+
+    # Get column name → SQLAlchemy type
+    dtype_mapping = {col.name: col.type for col in table.columns}
+
+    # Optionally restrict to df columns
+    if include_only_df_cols:
+        dtype_mapping = {col: dtype_mapping[col] for col in df.columns if col in dtype_mapping}
+
+    return dtype_mapping
+
+
