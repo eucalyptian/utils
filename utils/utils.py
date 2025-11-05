@@ -2,6 +2,7 @@ from sqlalchemy import NVARCHAR, create_engine, text, inspect, MetaData, Table
 from pandas.io.sql import get_schema
 from typing import Optional, Literal
 from urllib.parse import quote_plus
+import pandas as pd
 import re
 
 # setup logger to be created based on module name and reset every 24 hours at midnight. only keeps yesterday log as a separate date-named file.
