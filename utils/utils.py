@@ -219,10 +219,18 @@ def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_
             df.to_sql(table_name, con=conn, if_exists='append', index=False, dtype=dtype)
 
 
-def get_dtype_mapping_from_table(df: pd.DataFrame, engine, table_name: str, schema: str = "dbo", include_only_df_cols: bool = True):
+def get_dtype_mapping_from_table(
+    df: pd.DataFrame,
+    engine,
+    table_name: str,
+    schema: str = "dbo",
+    include_only_df_cols: bool = True,
+    fallback_max_length: Literal[255, 'max'] = 255
+):
     """
     Reads the SQL Server table schema and returns a dtype mapping dictionary
-    for use in pandas.to_sql().
+    for use in pandas.to_sql(). If the table does not exist, it falls back to
+    generating a mapping using `get_dtype_mapping()`.
 
     Parameters
     ----------
@@ -236,24 +244,59 @@ def get_dtype_mapping_from_table(df: pd.DataFrame, engine, table_name: str, sche
         Schema name where the table resides.
     include_only_df_cols : bool, default True
         If True, only return mappings for columns present in the dataframe.
+    fallback_max_length : {255, 'max'}, default 255
+        NVARCHAR length to use if the table does not exist.
 
     Returns
     -------
     dict
         A dictionary suitable for the `dtype` argument in df.to_sql()
         (e.g., {'fund': NVARCHAR(length=255), 'cost': FLOAT()}).
+
+    Raises
+    ------
+    sqlalchemy.exc.NoSuchTableError
+        If the table does not exist and fallback is disabled.
+
+    Notes
+    -----
+    - If the table exists, the function reflects the table schema directly
+      from SQL Server and uses the same column types.
+    - If the table does not exist, it falls back to inferring NVARCHAR types
+      for text columns in the DataFrame.
+
+    Examples
+    --------
+    >>> from sqlalchemy import create_engine
+    >>> import pandas as pd
+    >>> engine = create_engine("mssql+pyodbc://localhost/MyDB?driver=ODBC+Driver+17+for+SQL+Server")
+
+    >>> df = pd.DataFrame({
+    ...     'fund': ['A', 'B', 'C'],
+    ...     'value': [10.5, 20.2, 15.7]
+    ... })
+
+    # Case 1: Table exists — reflect SQL types
+    >>> dtype_map = get_dtype_mapping_from_table(df, engine, 'my_table')
+
+    # Case 2: Table doesn't exist — fallback to inferred mapping
+    >>> dtype_map = get_dtype_mapping_from_table(df, engine, 'nonexistent_table')
+
+    # Use it in to_sql()
+    >>> df.to_sql('my_table', engine, schema='dbo', if_exists='append', index=False, dtype=dtype_map)
     """
-
     metadata = MetaData()
-    table = Table(table_name, metadata, autoload_with=engine, schema=schema)
+    try:
+        table = Table(table_name, metadata, autoload_with=engine, schema=schema)
+        dtype_mapping = {col.name: col.type for col in table.columns}
 
-    # Get column name → SQLAlchemy type
-    dtype_mapping = {col.name: col.type for col in table.columns}
+        if include_only_df_cols:
+            dtype_mapping = {col: dtype_mapping[col] for col in df.columns if col in dtype_mapping}
 
-    # Optionally restrict to df columns
-    if include_only_df_cols:
-        dtype_mapping = {col: dtype_mapping[col] for col in df.columns if col in dtype_mapping}
+        return dtype_mapping
 
-    return dtype_mapping
+    except NoSuchTableError:
+        print(f"⚠️ Table '{schema}.{table_name}' does not exist — using fallback dtype mapping.")
+        return get_dtype_mapping(df, fallback_max_length)
 
 
