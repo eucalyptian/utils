@@ -1,4 +1,5 @@
 from sqlalchemy import NVARCHAR, create_engine, text, inspect, MetaData, Table
+from sqlalchemy.exc import NoSuchTableError
 from pandas.io.sql import get_schema
 from typing import Optional, Literal
 from urllib.parse import quote_plus
