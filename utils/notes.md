@@ -1,4 +1,5 @@
-# environment: cmd or git
+# Solve git push ssl problem
+environment: cmd or git
 command: `git push -u origin main`  
 error: fatal: unable to access 'https://github.com/eucalyptian/ime-options.git/': SSL peer certificate or SSH remote key was not OK  
 solution: `git config --global http.sslVerify false`  
