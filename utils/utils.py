@@ -5,6 +5,9 @@ from typing import Optional, Literal
 from urllib.parse import quote_plus
 import pandas as pd
 import re
+import os
+import logging
+from logging.handlers import TimedRotatingFileHandler
 
 # setup logger to be created based on module name and reset every 24 hours at midnight. only keeps yesterday log as a separate date-named file.
 def setup_logger():
