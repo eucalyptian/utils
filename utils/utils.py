@@ -1,26 +1,31 @@
 from sqlalchemy import NVARCHAR, create_engine, text, inspect, MetaData, Table
 from sqlalchemy.exc import NoSuchTableError
 from pandas.io.sql import get_schema
-from typing import Optional, Literal
+from typing import Optional, Literal, Union
 from urllib.parse import quote_plus
 import pandas as pd
+import numpy as np
 import re
 import os
 import logging
 from logging.handlers import TimedRotatingFileHandler
-
 # setup logger to be created based on module name and reset every 24 hours at midnight. only keeps yesterday log as a separate date-named file.
-def setup_logger():
-  module_name = os.path.splitext(os.path.basename(__file__))[0]
-  log_file = f"{module_name}.log"
-  # Set up rotating log handler
-  log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-  log_handler = TimedRotatingFileHandler(log_file, when='midnight', interval=1, backupCount=1, encoding='utf-8')
-  log_handler.setFormatter(log_formatter)
-  logger = logging.getLogger(module_name)
-  logger.setLevel(logging.INFO)
-  logger.addHandler(log_handler)
-  return logger
+def setup_logger(name, level):
+    module_name = os.path.splitext(os.path.basename(name))[0]
+    log_file = f"{module_name}.log"
+    # Set up rotating log handler
+    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    log_handler = TimedRotatingFileHandler(log_file, when='midnight', interval=1, backupCount=1, encoding='utf-8')
+    log_handler.setFormatter(log_formatter)
+    logger = logging.getLogger(module_name)
+    if level == 'INFO':
+        logger.setLevel(logging.INFO)
+    if level == 'DEBUG':
+        logger.setLevel(logging.DEBUG)
+    if level == 'WARNING':
+        logger.setLevel(logging.WARNING)
+    logger.addHandler(log_handler)
+    return logger
 
 proxies = {
     'http': None,
@@ -219,7 +224,7 @@ def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_
                     conn.execute(text(f'ALTER TABLE {table_name} ADD [{col}] {new_dtype}'))
             # Delete old data for this site
             delete_query = text(f"DELETE FROM {table_name} WHERE {identifier_column} = :identifier_value")
-            conn.execute(delete_query, {f"identifier_value": identifier_value})
+            conn.execute(delete_query, {f"identifier_value": float(identifier_value) if isinstance(identifier_value, Union[int, float, np.integer, np.floating]) else identifier_value})
             df.to_sql(table_name, con=conn, if_exists='append', index=False, dtype=dtype)
 
 
@@ -304,3 +309,49 @@ def get_dtype_mapping_from_table(
         return get_dtype_mapping(df, fallback_max_length)
 
 
+class RUN_WINDOW:
+    """
+    Params:
+      start: format: "HH:MM". Indifferent to trailing zeros.
+      end: format: "HH:MM". Indifferent to trailing zeros.
+      logger: logger object
+    
+    Sample usage:
+    run_window = RUN_WINDOW(logger=logger, start="12:00", end="17:01")
+    while True:
+        if run_window.is_open:
+            pass # means that the job can be run.
+        else:
+             time.sleep(run_window.sleep_time)
+             continue
+    """
+    def __init__(self, logger, start:str, end:str):
+        self.logger=logger
+        self.working_weekdays = [0, 1, 2, 5, 6]
+        self.sleep_time = None
+        self.start_time_hour = int(start.split(";")[0])
+        self.start_time_minute = int(start.split(";")[1])
+        self.end_time_hour = int(end.split(";")[0])
+        self.end_time_minute = int(end.split(";")[1])
+    @property
+    def is_open(self):
+        # if time is between start to end of open window then run, else: sleep until tomorrow
+        now = datetime.now()
+        start_time = now.replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+        end_time = now.replace(hour=self.end_time_hour, minute=self.end_time_minute, second=0, microsecond=0)
+
+        if not (start_time <= now <= end_time):
+            if now < start_time:
+                next_run = (now + timedelta(days=0)).replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+            else:  # means: end_time < now
+                next_run = (now + timedelta(days=1)).replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+            sleep_seconds = max(1, int((next_run - now).total_seconds()))
+            self.logger.info(f"Outside run window ({start}-{end}). Sleeping until {next_run}")
+            self.sleep_time = sleep_seconds
+            return False
+        if datetime.now().weekday() not in self.working_weekdays:
+            next_run = (now + timedelta(days=1)).replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+            sleep_seconds = max(1, int((next_run - now).total_seconds()))
+            self.sleep_time = sleep_seconds
+            return False
+        return True
