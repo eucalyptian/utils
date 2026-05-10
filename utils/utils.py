@@ -1,14 +1,21 @@
-from sqlalchemy import NVARCHAR, create_engine, text, inspect, MetaData, Table
-from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy import NVARCHAR, inspect, MetaData, Table, create_engine, text
+from sqlalchemy.exc import NoSuchTableError, OperationalError
+from logging.handlers import TimedRotatingFileHandler
+from typing import Optional, Dict, Literal, Union
+from datetime import timedelta, datetime
+from sqlalchemy.engine import Engine
 from pandas.io.sql import get_schema
-from typing import Optional, Literal, Union
 from urllib.parse import quote_plus
 import pandas as pd
 import numpy as np
+import platform
+import logging
+import pyodbc
+import time
 import re
 import os
-import logging
-from logging.handlers import TimedRotatingFileHandler
+
+
 # setup logger to be created based on module name and reset every 24 hours at midnight. only keeps yesterday log as a separate date-named file.
 def setup_logger(name, level):
     module_name = os.path.splitext(os.path.basename(name))[0]
@@ -27,6 +34,7 @@ def setup_logger(name, level):
     logger.addHandler(log_handler)
     return logger
 
+
 proxies = {
     'http': None,
     'https': None,
@@ -34,128 +42,161 @@ proxies = {
     'ftp': None,
 }
 
-def _build_odbc_connect(
-    server_str: str,
-    database: str,
-    *,
-    use_trusted: bool,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-    driver: str = "ODBC Driver 17 for SQL Server",
-    encrypt: Optional[str] = None,
-    trust_server_cert: Optional[bool] = None,
-) -> str:
-    """Return a URL-encoded ODBC connection string for use with SQLAlchemy's odbc_connect.
 
-    Notes
-    -----
-    • Works with named instances (e.g., "192.168.10.55\\sql10") or ports (e.g., "192.168.10.55,1435").
-    • If `use_trusted` is False, `username` and `password` are required.
-    • `encrypt` can be "yes" or "no". Some environments require Encrypt=yes and TrustServerCertificate=yes.
-    """
-    parts = [
-        f"DRIVER={{{{ {driver} }}}}".replace("{{ ", "{").replace(
-            " }}", "}"
-        ),  # ensure braces around driver name
-        f"SERVER={server_str}",
-        f"DATABASE={database}",
-    ]
+class SqlServerEngineFactory:
+    _engine_cache: Dict[str, Engine] = {}
 
-    if use_trusted:
-        parts.append("Trusted_Connection=yes")
-    else:
-        if not username or not password:
-            raise ValueError(
-                "Username and password must be provided when use_trusted is False."
+    @staticmethod
+    def detect_driver():
+        drivers = pyodbc.drivers()
+        sql_drivers = [
+            d for d in drivers
+            if "SQL Server" in d
+        ]
+        if not sql_drivers:
+            raise RuntimeError(
+                "No SQL Server ODBC driver found"
             )
-        parts.append(f"UID={username}")
-        parts.append(f"PWD={password}")
+        preferred_order = [
+            "ODBC Driver 18 for SQL Server",
+            "ODBC Driver 17 for SQL Server",
+            "SQL Server Native Client 11.0",
+            "SQL Server",
+        ]
+        for preferred in preferred_order:
+            if preferred in sql_drivers:
+                return preferred
+        # fallback
+        return sql_drivers[-1]
 
-    if encrypt is not None:
-        parts.append(f"Encrypt={encrypt}")
-    if trust_server_cert is not None:
-        parts.append(f"TrustServerCertificate={'yes' if trust_server_cert else 'no'}")
+    @staticmethod
+    def build_odbc_string(
+            server: str,
+            database: str,
+            username: Optional[str],
+            password: Optional[str],
+            encrypt: Optional[str],
+            trust_server_cert: Optional[bool],
+            driver: Optional[str],
+    ):
+        if driver is None:
+            driver = SqlServerEngineFactory.detect_driver()
+        os_platform = platform.system().lower()
+        parts = [
+            f"DRIVER={{{driver}}}",
+            f"SERVER={server}",
+            f"DATABASE={database}",
+        ]
+        if os_platform == "windows":
+            parts.append("Trusted_Connection=yes")
+        elif os_platform == "linux":
+            if not username or not password:
+                raise ValueError("Linux requires username and password")
+            parts.append(f"UID={username}")
+            parts.append(f"PWD={password}")
+            if encrypt is None:
+                encrypt = "yes"
+            if trust_server_cert is None:
+                trust_server_cert = True
+        else:
+            raise RuntimeError("Unsupported OS")
 
-    # URL-encode the full ODBC string for SQLAlchemy
-    return quote_plus(";".join(parts))
+        if encrypt:
+            parts.append(f"Encrypt={encrypt}")
+        if trust_server_cert is not None:
+            parts.append(
+                f"TrustServerCertificate={'yes' if trust_server_cert else 'no'}"
+            )
+        return quote_plus(";".join(parts))
 
+    @staticmethod
+    def _create_engine(url: str) -> Engine:
+        return create_engine(
+            url,
+            pool_size=15,
+            max_overflow=30,
+            pool_timeout=30,
+            pool_recycle=1800,
+            pool_pre_ping=True,
+            future=True,
+        )
 
-def engine_generator(
-    server: str,
-    database_name: str,
-    instance_name: Optional[str] = None,
-    use_trusted: bool = True,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-    *,
-    driver: str = "ODBC Driver 17 for SQL Server",
-    encrypt: Optional[str] = None,
-    trust_server_cert: Optional[bool] = None,
-):
-    """Create (if needed) and return a SQLAlchemy engine for a SQL Server database.
+    @staticmethod
+    def _connect_with_retry(url: str, retries=3, delay=2):
+        for attempt in range(retries):
+            try:
+                engine = SqlServerEngineFactory._create_engine(url)
+                with engine.connect():
+                    return engine
+            except OperationalError:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(delay)
 
-    Parameters
-    ----------
-    server : str
-        IP/hostname. For a named instance, also supply `instance_name` OR pass "host\\instance" directly.
-        For a port-based connection, pass "host,port" and leave `instance_name=None`.
-    use_trusted : bool
-        True = Windows (Integrated) auth. False = SQL auth (requires username/password).
-    encrypt / trust_server_cert : Optional extras to satisfy driver/security policy.
-    """
-
-    # Build SERVER string
-    server_str = f"{server}\\{instance_name}" if instance_name else server
-
-    # Build a master-DB connection first (for create/check)
-    master_odbc = _build_odbc_connect(
-        server_str,
-        "master",
-        use_trusted=use_trusted,
-        username=username,
-        password=password,
-        driver=driver,
-        encrypt=encrypt,
-        trust_server_cert=trust_server_cert,
-    )
-    master_url = f"mssql+pyodbc:///?odbc_connect={master_odbc}"
-
-    # Helper fns
-    def check_database_exists(engine, dbname):
+    @staticmethod
+    def _database_exists(engine: Engine, dbname: str):
         with engine.connect() as conn:
             result = conn.execute(
-                text("SELECT 1 FROM sys.databases WHERE name = :n"), {"n": dbname}
+                text("SELECT 1 FROM sys.databases WHERE name = :name"),
+                {"name": dbname},
             )
-            return result.fetchone() is not None
+            return result.scalar() is not None
 
-    def create_database_if_needed(engine, dbname):
-        if not check_database_exists(engine, dbname):
-            with engine.connect() as conn:
-                conn.execution_options(isolation_level="AUTOCOMMIT").execute(
-                    text(f"CREATE DATABASE [{dbname}]")
-                )
-                print(f"Database '{dbname}' created.")
+    @staticmethod
+    def _create_database(engine: Engine, dbname: str):
+        with engine.connect() as conn:
+            conn.execution_options(isolation_level="AUTOCOMMIT").execute(
+                text(f"CREATE DATABASE [{dbname}]")
+            )
+
+    @classmethod
+    def get_engine(
+            cls,
+            server: str,
+            database: str,
+            instance: Optional[str] = None,
+            username: Optional[str] = None,
+            password: Optional[str] = None,
+            driver: Optional[str] = None,
+            encrypt: Optional[str] = None,
+            trust_server_cert: Optional[bool] = None,
+    ) -> Engine:
+
+        server_str = f"{server}\\{instance}" if instance else server
+        cache_key = f"{server_str}_{database}"
+        if cache_key in cls._engine_cache:
+            print(f'Engine for {database} already exists... (Singleton)')
+            return cls._engine_cache[cache_key]
+        master_odbc = cls.build_odbc_string(
+            server_str,
+            "master",
+            username,
+            password,
+            encrypt,
+            trust_server_cert,
+            driver,
+        )
+        master_url = f"mssql+pyodbc:///?odbc_connect={master_odbc}"
+        master_engine = cls._connect_with_retry(master_url)
+        if not cls._database_exists(master_engine, database):
+            print(f"Database {database} does not exist. Creating ...")
+            cls._create_database(master_engine, database)
         else:
-            print(f"Database '{dbname}' already exists.")
-
-    # Connect to master, ensure DB exists
-    engine_master = create_engine(master_url)
-    create_database_if_needed(engine_master, database_name)
-    engine_master.dispose()
-
-    # Connect to the target DB
-    db_odbc = _build_odbc_connect(
-        server_str,
-        database_name,
-        use_trusted=use_trusted,
-        username=username,
-        password=password,
-        driver=driver,
-        encrypt=encrypt,
-        trust_server_cert=trust_server_cert,
-    )
-    db_url = f"mssql+pyodbc:///?odbc_connect={db_odbc}"
-    return create_engine(db_url)
+            print(f'Database {database} already exists...')
+        master_engine.dispose()
+        db_odbc = cls.build_odbc_string(
+            server_str,
+            database,
+            username,
+            password,
+            encrypt,
+            trust_server_cert,
+            driver,
+        )
+        db_url = f"mssql+pyodbc:///?odbc_connect={db_odbc}"
+        engine = cls._connect_with_retry(db_url)
+        cls._engine_cache[cache_key] = engine
+        return engine
 
 
 def get_dtype_mapping(df, max_length: Literal[255, 'max']):
@@ -168,8 +209,6 @@ def get_dtype_mapping(df, max_length: Literal[255, 'max']):
         if dtype in ['object', 'string']:  # Object types are often text columns
             dtype_mapping[col] = NVARCHAR(length)  # Adjust NVARCHAR size as needed
     return dtype_mapping
-
-
 
 
 def parse_create_table(ddl: str) -> dict:
@@ -195,11 +234,13 @@ def parse_create_table(ddl: str) -> dict:
 
     return col_types
 
-def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_value, allow_column_mismatch, max_length=255, dtype=None):
+
+def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_value, allow_column_mismatch,
+                     max_length=255, dtype=None):
     inspector = inspect(engine_name)
     table_exists = table_name in inspector.get_table_names()
     if not dtype:
-      dtype = get_dtype_mapping(df, max_length=max_length)
+        dtype = get_dtype_mapping(df, max_length=max_length)
     auto_dtypes = parse_create_table(get_schema(df, name='my_table', con=engine_name))
     with engine_name.begin() as conn:
         if not table_exists:
@@ -220,21 +261,23 @@ def upsert_sql_table(df, engine_name, table_name, identifier_column, identifier_
                         new_dtype = dtype[col]  # or infer based on df[col].dtype
                     else:
                         new_dtype = auto_dtypes[col]
-                    
+
                     conn.execute(text(f'ALTER TABLE {table_name} ADD [{col}] {new_dtype}'))
             # Delete old data for this site
             delete_query = text(f"DELETE FROM {table_name} WHERE {identifier_column} = :identifier_value")
-            conn.execute(delete_query, {f"identifier_value": float(identifier_value) if isinstance(identifier_value, Union[int, float, np.integer, np.floating]) else identifier_value})
+            conn.execute(delete_query, {f"identifier_value": float(identifier_value) if isinstance(identifier_value,
+                                                                                                   Union[
+                                                                                                       int, float, np.integer, np.floating]) else identifier_value})
             df.to_sql(table_name, con=conn, if_exists='append', index=False, dtype=dtype)
 
 
 def get_dtype_mapping_from_table(
-    df: pd.DataFrame,
-    engine,
-    table_name: str,
-    schema: str = "dbo",
-    include_only_df_cols: bool = True,
-    fallback_max_length: Literal[255, 'max'] = 255
+        df: pd.DataFrame,
+        engine,
+        table_name: str,
+        schema: str = "dbo",
+        include_only_df_cols: bool = True,
+        fallback_max_length: Literal[255, 'max'] = 255
 ):
     """
     Reads the SQL Server table schema and returns a dtype mapping dictionary
@@ -315,7 +358,7 @@ class RUN_WINDOW:
       start: format: "HH:MM". Indifferent to trailing zeros.
       end: format: "HH:MM". Indifferent to trailing zeros.
       logger: logger object
-    
+
     Sample usage:
     run_window = RUN_WINDOW(logger=logger, start="12:00", end="17:01")
     while True:
@@ -325,14 +368,18 @@ class RUN_WINDOW:
              time.sleep(run_window.sleep_time)
              continue
     """
-    def __init__(self, logger, start:str, end:str):
-        self.logger=logger
+
+    def __init__(self, logger, start: str, end: str):
+        self.logger = logger
         self.working_weekdays = [0, 1, 2, 5, 6]
         self.sleep_time = None
+        self.start = start
+        self.end = end
         self.start_time_hour = int(start.split(";")[0])
         self.start_time_minute = int(start.split(";")[1])
         self.end_time_hour = int(end.split(";")[0])
         self.end_time_minute = int(end.split(";")[1])
+
     @property
     def is_open(self):
         # if time is between start to end of open window then run, else: sleep until tomorrow
@@ -342,15 +389,18 @@ class RUN_WINDOW:
 
         if not (start_time <= now <= end_time):
             if now < start_time:
-                next_run = (now + timedelta(days=0)).replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+                next_run = (now + timedelta(days=0)).replace(hour=self.start_time_hour, minute=self.start_time_minute,
+                                                             second=0, microsecond=0)
             else:  # means: end_time < now
-                next_run = (now + timedelta(days=1)).replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+                next_run = (now + timedelta(days=1)).replace(hour=self.start_time_hour, minute=self.start_time_minute,
+                                                             second=0, microsecond=0)
             sleep_seconds = max(1, int((next_run - now).total_seconds()))
-            self.logger.info(f"Outside run window ({start}-{end}). Sleeping until {next_run}")
+            self.logger.info(f"Outside run window ({self.start}-{self.end}). Sleeping until {next_run}")
             self.sleep_time = sleep_seconds
             return False
         if datetime.now().weekday() not in self.working_weekdays:
-            next_run = (now + timedelta(days=1)).replace(hour=self.start_time_hour, minute=self.start_time_minute, second=0, microsecond=0)
+            next_run = (now + timedelta(days=1)).replace(hour=self.start_time_hour, minute=self.start_time_minute,
+                                                         second=0, microsecond=0)
             sleep_seconds = max(1, int((next_run - now).total_seconds()))
             self.sleep_time = sleep_seconds
             return False
