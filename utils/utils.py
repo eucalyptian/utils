@@ -375,10 +375,10 @@ class RUN_WINDOW:
         self.sleep_time = None
         self.start = start
         self.end = end
-        self.start_time_hour = int(start.split(";")[0])
-        self.start_time_minute = int(start.split(";")[1])
-        self.end_time_hour = int(end.split(";")[0])
-        self.end_time_minute = int(end.split(";")[1])
+        self.start_time_hour = int(start.split(":")[0])
+        self.start_time_minute = int(start.split(":")[1])
+        self.end_time_hour = int(end.split(":")[0])
+        self.end_time_minute = int(end.split(":")[1])
 
     @property
     def is_open(self):
